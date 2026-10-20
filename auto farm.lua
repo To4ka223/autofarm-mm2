@@ -5,6 +5,7 @@ local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local VirtualUser = game:GetService("VirtualUser")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
 local character = player.Character or player.CharacterAdded:Wait()
@@ -18,6 +19,7 @@ local MAX_DIST = 1000
 local TARGET_SPEED = 23
 local RESET_DELAY = 5.0
 local ROUND_START_DELAY = 1.5
+local WEBHOOK_INTERVAL = 1800
 
 local enabled = false
 local afkActive = false
@@ -52,6 +54,14 @@ local flingFPDH = workspace.FallenPartsDestroyHeight
 local PlayerData = nil
 local PlayerDataChanged = nil
 local RolesPlrName = { ["Sheriff"] = false, ["Murderer"] = false, ["Innocent"] = false, ["Hero"] = false }
+
+local webhookUrl = ""
+local sessionStartTime = os.time()
+local coinsCollectedTotal = 0
+local flingsTotal = 0
+local resetsTotal = 0
+local lastWebhookTime = os.time()
+local webhookThread = nil
 
 local function findRemote(name)
     local ok, result = pcall(function()
@@ -187,8 +197,6 @@ local function SkidFling(target)
         until startT + dur < tick() or not flingActive
     end
 
-    workspace.FallenPartsDestroyHeight = 0 / 0
-
     local bv = Instance.new("BodyVelocity")
     bv.Parent = myRoot
     bv.Velocity = Vector3.new(0, 0, 0)
@@ -209,18 +217,9 @@ local function SkidFling(target)
     workspace.CurrentCamera.CameraSubject = myHum
 
     if flingOldPos then
-        repeat
-            myRoot.CFrame = flingOldPos * CFrame.new(0, 0.5, 0)
-            myChar:SetPrimaryPartCFrame(flingOldPos * CFrame.new(0, 0.5, 0))
-            myHum:ChangeState("GettingUp")
-            for _, v in pairs(myChar:GetChildren()) do
-                if v:IsA("BasePart") then
-                    v.Velocity, v.RotVelocity = Vector3.new(), Vector3.new()
-                end
-            end
-            task.wait()
-        until (myRoot.Position - flingOldPos.p).Magnitude < 25
-        workspace.FallenPartsDestroyHeight = flingFPDH
+        myRoot.CFrame = flingOldPos
+        myRoot.Velocity = Vector3.new(0, 0, 0)
+        myRoot.RotVelocity = Vector3.new(0, 0, 0)
     end
 end
 
@@ -229,6 +228,7 @@ local function flingMurderer(reason)
     local murderer = findMurderer()
     if not murderer then return end
     flingActive = true
+    flingsTotal = flingsTotal + 1
     print("[FLING]", reason, murderer.Name)
     task.delay(15, function()
         if flingActive then flingActive = false end
@@ -399,6 +399,7 @@ local function triggerBagFullReset()
     task.wait(0.2)
     if humanoid and humanoid.Health > 0 then
         humanoid.Health = 0
+        resetsTotal = resetsTotal + 1
     end
 end
 
@@ -497,6 +498,7 @@ local function startMovementEngine()
                 rootPart.CFrame = CFrame.new(targetPos)
                 stopMovement()
                 hasCollectedThisLife = true
+                coinsCollectedTotal = coinsCollectedTotal + 1
                 blacklistedCoins[currentTarget] = true
                 activeCoins[currentTarget] = nil
                 currentTarget = nil
@@ -515,9 +517,62 @@ local function startMovementEngine()
                     noCoinsStartTime = nil
                     cleanupConnections()
                     humanoid.Health = 0
+                    resetsTotal = resetsTotal + 1
                 end
             else
                 noCoinsStartTime = nil
+            end
+        end
+    end)
+end
+
+local function formatTime(seconds)
+    local h = math.floor(seconds / 3600)
+    local m = math.floor((seconds % 3600) / 60)
+    local s = math.floor(seconds % 60)
+    return string.format("%02d:%02d:%02d", h, m, s)
+end
+
+local function sendWebhook()
+    if webhookUrl == "" or not webhookUrl:find("https://discord.com/api/webhooks/") then return end
+    local elapsed = os.time() - sessionStartTime
+    local payload = {
+        username = "AutoFarm Stats",
+        embeds = {{
+            title = "Farm Session Report",
+            color = 3447003,
+            fields = {
+                { name = "Session Time", value = formatTime(elapsed), inline = true },
+                { name = "Coins Collected", value = tostring(coinsCollectedTotal), inline = true },
+                { name = "Flings", value = tostring(flingsTotal), inline = true },
+                { name = "Resets", value = tostring(resetsTotal), inline = true },
+                { name = "Player", value = player.Name, inline = true },
+            },
+            footer = { text = "AutoFarm by " .. player.Name },
+            timestamp = DateTime.now():ToIsoDate()
+        }}
+    }
+    local body = HttpService:JSONEncode(payload)
+    local ok, err = pcall(function()
+        request({
+            Url = webhookUrl,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = body
+        })
+    end)
+    if ok then
+        lastWebhookTime = os.time()
+    end
+end
+
+local function startWebhookLoop()
+    if webhookThread then task.cancel(webhookThread) end
+    webhookThread = task.spawn(function()
+        while true do
+            task.wait(WEBHOOK_INTERVAL)
+            if webhookUrl ~= "" then
+                sendWebhook()
             end
         end
     end)
@@ -591,8 +646,8 @@ ScreenGui.Parent = player:WaitForChild("PlayerGui")
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
 local Main = Instance.new("Frame")
-Main.Size = UDim2.new(0, 260, 0, 270)
-Main.Position = UDim2.new(0.5, -130, 0.5, -135)
+Main.Size = UDim2.new(0, 300, 0, 480)
+Main.Position = UDim2.new(0.5, -150, 0.5, -240)
 Main.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
 Main.BackgroundTransparency = 0.05
 Main.BorderSizePixel = 0
@@ -623,13 +678,13 @@ CoinIcon.TextSize = 18
 CoinIcon.Parent = Header
 
 local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(0, 100, 0, 20)
+Title.Size = UDim2.new(0, 150, 0, 20)
 Title.Position = UDim2.new(0, 36, 0.5, -10)
 Title.BackgroundTransparency = 1
-Title.Text = "Coin Farm"
+Title.Text = "Coin Farm + Webhook"
 Title.TextColor3 = Color3.fromRGB(230, 230, 245)
 Title.Font = Enum.Font.GothamBold
-Title.TextSize = 15
+Title.TextSize = 14
 Title.TextXAlignment = Enum.TextXAlignment.Left
 Title.Parent = Header
 
@@ -653,61 +708,37 @@ CloseBtn.MouseButton1Click:Connect(function()
     ScreenGui:Destroy()
 end)
 
-local Row1 = Instance.new("Frame")
-Row1.Size = UDim2.new(1, -16, 0, 40)
-Row1.Position = UDim2.new(0, 8, 0, 46)
-Row1.BackgroundColor3 = Color3.fromRGB(25, 25, 38)
-Row1.BackgroundTransparency = 0.1
-Row1.BorderSizePixel = 0
-Row1.Parent = Main
+local function createRow(yPos, labelText, height)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -16, 0, height or 40)
+    row.Position = UDim2.new(0, 8, 0, yPos)
+    row.BackgroundColor3 = Color3.fromRGB(25, 25, 38)
+    row.BackgroundTransparency = 0.1
+    row.BorderSizePixel = 0
+    row.Parent = Main
 
-local Row1Corner = Instance.new("UICorner")
-Row1Corner.CornerRadius = UDim.new(0, 8)
-Row1Corner.Parent = Row1
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = row
 
-local Row1Stroke = Instance.new("UIStroke")
-Row1Stroke.Color = Color3.fromRGB(80, 140, 255)
-Row1Stroke.Thickness = 2
-Row1Stroke.Parent = Row1
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(80, 140, 255)
+    stroke.Thickness = 2
+    stroke.Parent = row
 
-local Row1Label = Instance.new("TextLabel")
-Row1Label.Size = UDim2.new(0.5, 0, 1, 0)
-Row1Label.Position = UDim2.new(0, 12, 0, 0)
-Row1Label.BackgroundTransparency = 1
-Row1Label.Text = "Auto Farm"
-Row1Label.TextColor3 = Color3.fromRGB(220, 220, 240)
-Row1Label.Font = Enum.Font.GothamMedium
-Row1Label.TextSize = 14
-Row1Label.TextXAlignment = Enum.TextXAlignment.Left
-Row1Label.Parent = Row1
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.5, 0, 1, 0)
+    label.Position = UDim2.new(0, 12, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(220, 220, 240)
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 14
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
 
-local Row2 = Instance.new("Frame")
-Row2.Size = UDim2.new(1, -16, 0, 40)
-Row2.Position = UDim2.new(0, 8, 0, 94)
-Row2.BackgroundColor3 = Color3.fromRGB(25, 25, 38)
-Row2.BackgroundTransparency = 0.1
-Row2.BorderSizePixel = 0
-Row2.Parent = Main
-
-local Row2Corner = Instance.new("UICorner")
-Row2Corner.CornerRadius = UDim.new(0, 8)
-Row2Corner.Parent = Row2
-
-local Row2Stroke = Instance.new("UIStroke")
-Row2Stroke.Color = Color3.fromRGB(80, 140, 255)
-Row2Stroke.Thickness = 2
-Row2Stroke.Parent = Row2
-
-local Row2Label = Instance.new("TextLabel")
-Row2Label.Size = UDim2.new(0.5, 0, 1, 0)
-Row2Label.Position = UDim2.new(0, 12, 0, 0)
-Row2Label.BackgroundTransparency = 1
-Row2Label.Text = "Anti-AFK"
-Row2Label.TextColor3 = Color3.fromRGB(220, 220, 240)
-Row2Label.Font = Enum.Font.GothamMedium
-Row2Label.TextSize = 14
-Row2Label.TextXAlignment = Enum.TextXAlignment.Left
-Row2Label.Parent = Row2
+    return row
+end
 
 local function createToggle(parent, initialVal, callback)
     local toggle = Instance.new("TextButton")
@@ -745,6 +776,7 @@ local function createToggle(parent, initialVal, callback)
     return toggle
 end
 
+local Row1 = createRow(46, "Auto Farm")
 createToggle(Row1, false, function(state)
     enabled = state
     if state then
@@ -758,50 +790,112 @@ createToggle(Row1, false, function(state)
     end
 end)
 
+local Row2 = createRow(94, "Anti-AFK")
 createToggle(Row2, false, function(state)
     afkActive = state
     if state and enabled then task.spawn(antiAfkLoop) end
 end)
 
-local function createFlingRow(yPos, labelText, callback)
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, -16, 0, 40)
-    row.Position = UDim2.new(0, 8, 0, yPos)
-    row.BackgroundColor3 = Color3.fromRGB(25, 25, 38)
-    row.BackgroundTransparency = 0.1
-    row.BorderSizePixel = 0
-    row.Parent = Main
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = row
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(200, 80, 80)
-    stroke.Thickness = 2
-    stroke.Parent = row
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(0.7, 0, 1, 0)
-    label.Position = UDim2.new(0, 12, 0, 0)
-    label.BackgroundTransparency = 1
-    label.Text = labelText
-    label.TextColor3 = Color3.fromRGB(220, 220, 240)
-    label.Font = Enum.Font.GothamMedium
-    label.TextSize = 13
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Parent = row
-
-    createToggle(row, false, callback)
-end
-
-createFlingRow(142, "Fling Murderer (Bag Full)", function(state)
+local Row3 = createRow(142, "Fling Murderer (Bag Full)")
+createToggle(Row3, false, function(state)
     flingBagFullEnabled = state
 end)
 
-createFlingRow(190, "Fling Murderer (After Death)", function(state)
+local Row4 = createRow(190, "Fling Murderer (After Death)")
+createToggle(Row4, false, function(state)
     flingAfterDeathEnabled = state
 end)
+
+local StatsLabel = Instance.new("TextLabel")
+StatsLabel.Size = UDim2.new(1, -16, 0, 50)
+StatsLabel.Position = UDim2.new(0, 8, 0, 238)
+StatsLabel.BackgroundColor3 = Color3.fromRGB(25, 25, 38)
+StatsLabel.BackgroundTransparency = 0.1
+StatsLabel.Text = ""
+StatsLabel.TextColor3 = Color3.fromRGB(180, 220, 255)
+StatsLabel.Font = Enum.Font.GothamMedium
+StatsLabel.TextSize = 12
+StatsLabel.TextXAlignment = Enum.TextXAlignment.Left
+StatsLabel.Parent = Main
+
+local StatsCorner = Instance.new("UICorner")
+StatsCorner.CornerRadius = UDim.new(0, 8)
+StatsCorner.Parent = StatsLabel
+
+local StatsStroke = Instance.new("UIStroke")
+StatsStroke.Color = Color3.fromRGB(80, 140, 255)
+StatsStroke.Thickness = 2
+StatsStroke.Parent = StatsLabel
+
+task.spawn(function()
+    while ScreenGui.Parent do
+        task.wait(1)
+        local elapsed = os.time() - sessionStartTime
+        StatsLabel.Text = string.format(
+            "  Session: %s\n  Coins: %d\n  Flings: %d\n  Resets: %d",
+            formatTime(elapsed), coinsCollectedTotal, flingsTotal, resetsTotal
+        )
+    end
+end)
+
+local WebhookRow = createRow(296, "Webhook URL", 60)
+
+local WebhookBox = Instance.new("TextBox")
+WebhookBox.Size = UDim2.new(1, -16, 0, 30)
+WebhookBox.Position = UDim2.new(0, 8, 1, -35)
+WebhookBox.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+WebhookBox.BackgroundTransparency = 0.2
+WebhookBox.Text = ""
+WebhookBox.PlaceholderText = "https://discord.com/api/webhooks/..."
+WebhookBox.TextColor3 = Color3.fromRGB(220, 220, 240)
+WebhookBox.PlaceholderColor3 = Color3.fromRGB(120, 120, 140)
+WebhookBox.Font = Enum.Font.Gotham
+WebhookBox.TextSize = 12
+WebhookBox.TextXAlignment = Enum.TextXAlignment.Left
+WebhookBox.ClearTextOnFocus = false
+WebhookBox.Parent = WebhookRow
+
+local WebhookCorner = Instance.new("UICorner")
+WebhookCorner.CornerRadius = UDim.new(0, 6)
+WebhookCorner.Parent = WebhookBox
+
+WebhookBox.FocusLost:Connect(function()
+    webhookUrl = WebhookBox.Text
+    lastWebhookTime = os.time()
+    if webhookUrl ~= "" then
+        startWebhookLoop()
+    end
+end)
+
+local SendBtn = Instance.new("TextButton")
+SendBtn.Size = UDim2.new(1, -16, 0, 30)
+SendBtn.Position = UDim2.new(0, 8, 0, 364)
+SendBtn.BackgroundColor3 = Color3.fromRGB(80, 130, 255)
+SendBtn.Text = "Send Stats Now"
+SendBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+SendBtn.Font = Enum.Font.GothamBold
+SendBtn.TextSize = 13
+SendBtn.Parent = Main
+
+local SendCorner = Instance.new("UICorner")
+SendCorner.CornerRadius = UDim.new(0, 6)
+SendCorner.Parent = SendBtn
+
+SendBtn.MouseButton1Click:Connect(function()
+    sendWebhook()
+end)
+
+local InfoLabel = Instance.new("TextLabel")
+InfoLabel.Size = UDim2.new(1, -16, 0, 40)
+InfoLabel.Position = UDim2.new(0, 8, 0, 400)
+InfoLabel.BackgroundTransparency = 1
+InfoLabel.Text = "Auto-send every 30 min if URL is set"
+InfoLabel.TextColor3 = Color3.fromRGB(150, 150, 170)
+InfoLabel.Font = Enum.Font.Gotham
+InfoLabel.TextSize = 11
+InfoLabel.TextXAlignment = Enum.TextXAlignment.Left
+InfoLabel.TextWrapped = true
+InfoLabel.Parent = Main
 
 local dragging, dragStart, startPos = false, nil, nil
 Header.InputBegan:Connect(function(input)
